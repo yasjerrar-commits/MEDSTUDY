@@ -1,0 +1,6 @@
+{
+  "name": "MEDSTUDY",
+  "description": "Plateforme interactive d'étude médicale en français pour les étudiants de 1ère année de médecine : cours structurés, QCM intelligents, flashcards à répétition espacée, gestion de PDF et outils pédagogiques IA.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

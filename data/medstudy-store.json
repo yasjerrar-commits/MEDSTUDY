@@ -1,0 +1,39 @@
+{
+  "preferences": {
+    "studentName": "Étudiant(e) en 1ère Année",
+    "theme": "light",
+    "readerFontSize": "md",
+    "dailyGoalMinutes": 60,
+    "dailyGoalQcms": 20
+  },
+  "completedLessonIds": [],
+  "bookmarkedLessonIds": [],
+  "recentlyStudiedLessons": [],
+  "studySecondsByModule": {
+    "anatomie": 0,
+    "biophysique": 0,
+    "biochimie": 0,
+    "sante-publique": 0,
+    "terminologie": 0,
+    "personnalise": 0
+  },
+  "qcmAttempts": [],
+  "favoriteQcmIds": [],
+  "wrongQcmCounts": {},
+  "flashcardProgress": {},
+  "notes": [],
+  "highlights": [],
+  "uploadedCourses": [],
+  "customModule": {
+    "title": "Module Personnalisable",
+    "subtitle": "Votre espace d’étude sur mesure",
+    "description": "Renommez ce module selon votre matière (Embryologie, Histologie, Biologie cellulaire...) et importez vos propres cours, PDF et fiches.",
+    "accentColor": "teal",
+    "chapters": [],
+    "flashcards": [],
+    "qcms": []
+  },
+  "importedQcms": [],
+  "importedFlashcards": [],
+  "dailyActivity": {}
+}
