@@ -125,6 +125,9 @@ export function useStudyStore() {
   const [isLoaded, setIsLoaded] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
   const saveTimerRef = useRef<number | null>(null);
+  const serverVersionRef = useRef(0);
+  const pendingSaveRef = useRef(false);
+  const inFlightSaveRef = useRef(false);
 
   // Sync theme to documentElement immediately
   useEffect(() => {
@@ -136,31 +139,64 @@ export function useStudyStore() {
     }
   }, [state.preferences.theme]);
 
-  // Initial load from Express persistent backend
+  // Load from the shared cloud store, then keep every device in sync
   useEffect(() => {
     let active = true;
-    fetch('/api/state')
-      .then((res) => {
+
+    const pullFromServer = async () => {
+      const res = await fetch('/api/state', { cache: 'no-store' });
+      if (!res.ok) throw new Error('Erreur réseau');
+      const payload: { state: Partial<UserStudyState>; version: number } = await res.json();
+      if (!active || pendingSaveRef.current || inFlightSaveRef.current) return;
+      serverVersionRef.current = payload.version;
+      const merged = mergeWithDefault(payload.state);
+      setState(merged);
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+      } catch {
+        // ignore
+      }
+      setSyncError(null);
+    };
+
+    const checkForRemoteChanges = async () => {
+      if (pendingSaveRef.current || inFlightSaveRef.current) return;
+      if (document.visibilityState !== 'visible') return;
+      try {
+        const res = await fetch('/api/state/version', { cache: 'no-store' });
         if (!res.ok) throw new Error('Erreur réseau');
-        return res.json();
-      })
-      .then((serverData: Partial<UserStudyState>) => {
-        if (!active) return;
-        const merged = mergeWithDefault(serverData);
-        setState(merged);
-        try {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
-        } catch {
-          // ignore
+        const { version } = (await res.json()) as { version: number };
+        if (version > serverVersionRef.current) {
+          await pullFromServer();
         }
-        setIsLoaded(true);
-      })
+        setSyncError(null);
+      } catch {
+        if (active) setSyncError('Mode hors ligne : modifications enregistrées localement.');
+      }
+    };
+
+    pullFromServer()
       .catch(() => {
-        if (!active) return;
-        setIsLoaded(true);
+        if (active) setSyncError('Mode hors ligne : modifications enregistrées localement.');
+      })
+      .finally(() => {
+        if (active) setIsLoaded(true);
       });
+
+    const intervalId = window.setInterval(checkForRemoteChanges, 4000);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') checkForRemoteChanges();
+    };
+    window.addEventListener('focus', onVisible);
+    window.addEventListener('online', onVisible);
+    document.addEventListener('visibilitychange', onVisible);
+
     return () => {
       active = false;
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', onVisible);
+      window.removeEventListener('online', onVisible);
+      document.removeEventListener('visibilitychange', onVisible);
     };
   }, []);
 
@@ -170,21 +206,30 @@ export function useStudyStore() {
     } catch {
       // ignore quota error
     }
+    pendingSaveRef.current = true;
     if (saveTimerRef.current) {
       window.clearTimeout(saveTimerRef.current);
     }
     saveTimerRef.current = window.setTimeout(() => {
+      pendingSaveRef.current = false;
+      inFlightSaveRef.current = true;
       fetch('/api/state', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(next),
+        keepalive: true,
       })
-        .then((res) => {
+        .then(async (res) => {
           if (!res.ok) throw new Error('Échec de synchronisation');
+          const { version } = (await res.json()) as { version: number };
+          serverVersionRef.current = Math.max(serverVersionRef.current, version);
           setSyncError(null);
         })
         .catch(() => {
           setSyncError('Mode hors ligne : modifications enregistrées localement.');
+        })
+        .finally(() => {
+          inFlightSaveRef.current = false;
         });
     }, 250);
   }, []);

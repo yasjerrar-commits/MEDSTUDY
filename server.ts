@@ -5,17 +5,31 @@ import path from 'path';
 import multer from 'multer';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
+import { neon } from '@neondatabase/serverless';
+import { put, get, del } from '@vercel/blob';
 import { createServer as createViteServer } from 'vite';
 
-dotenv.config();
+dotenv.config({ path: ['.env.development.local', '.env'] });
 
 const PORT = 3000;
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
-const STORE_FILE = path.join(DATA_DIR, 'medstudy-store.json');
+const PROFILE_ID = 'default';
+const LEGACY_STORE_FILE = path.resolve(process.cwd(), 'data', 'medstudy-store.json');
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL manquant : connectez l’intégration Neon.');
+}
+const sql = neon(process.env.DATABASE_URL);
+
+async function ensureSchema() {
+  await sql`
+    CREATE TABLE IF NOT EXISTS medstudy_state (
+      id TEXT PRIMARY KEY,
+      data JSONB NOT NULL,
+      version BIGINT NOT NULL DEFAULT 1,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `;
+}
 
 function getDefaultState() {
   return {
@@ -61,57 +75,85 @@ function getDefaultState() {
   };
 }
 
-function readStore() {
+function mergeState(parsed: Record<string, any>) {
+  const def = getDefaultState();
+  return {
+    ...def,
+    ...parsed,
+    preferences: { ...def.preferences, ...(parsed.preferences || {}) },
+    studySecondsByModule: {
+      ...def.studySecondsByModule,
+      ...(parsed.studySecondsByModule || {}),
+    },
+    customModule: {
+      ...def.customModule,
+      ...(parsed.customModule || {}),
+    },
+  };
+}
+
+function readLegacyFileState(): Record<string, any> | null {
   try {
-    if (!fs.existsSync(STORE_FILE)) {
-      const initial = getDefaultState();
-      fs.writeFileSync(STORE_FILE, JSON.stringify(initial, null, 2), 'utf-8');
-      return initial;
-    }
-    const raw = fs.readFileSync(STORE_FILE, 'utf-8');
-    const parsed = JSON.parse(raw);
-    const def = getDefaultState();
-    return {
-      ...def,
-      ...parsed,
-      preferences: { ...def.preferences, ...(parsed.preferences || {}) },
-      studySecondsByModule: {
-        ...def.studySecondsByModule,
-        ...(parsed.studySecondsByModule || {}),
-      },
-      customModule: {
-        ...def.customModule,
-        ...(parsed.customModule || {}),
-      },
-    };
-  } catch (err) {
-    console.error('Erreur lecture store:', err);
-    return getDefaultState();
+    if (!fs.existsSync(LEGACY_STORE_FILE)) return null;
+    return JSON.parse(fs.readFileSync(LEGACY_STORE_FILE, 'utf-8'));
+  } catch {
+    return null;
   }
 }
 
-function writeStore(state: unknown) {
-  const tmpFile = `${STORE_FILE}.tmp`;
-  fs.writeFileSync(tmpFile, JSON.stringify(state, null, 2), 'utf-8');
-  fs.renameSync(tmpFile, STORE_FILE);
+async function readStore(): Promise<{ state: Record<string, any>; version: number }> {
+  const rows = await sql`SELECT data, version FROM medstudy_state WHERE id = ${PROFILE_ID}`;
+  if (rows.length > 0) {
+    return { state: mergeState(rows[0].data), version: Number(rows[0].version) };
+  }
+  const initial = mergeState(readLegacyFileState() || {});
+  await sql`
+    INSERT INTO medstudy_state (id, data, version)
+    VALUES (${PROFILE_ID}, ${JSON.stringify(initial)}::jsonb, 1)
+    ON CONFLICT (id) DO NOTHING
+  `;
+  return { state: initial, version: 1 };
 }
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    cb(null, UPLOADS_DIR);
-  },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const safeBase = path
-      .basename(file.originalname, ext)
-      .replace(/[^a-zA-Z0-9_-]/g, '_')
-      .slice(0, 40);
-    cb(null, `${Date.now()}_${safeBase}${ext}`);
-  },
-});
+async function readVersion(): Promise<number> {
+  const rows = await sql`SELECT version FROM medstudy_state WHERE id = ${PROFILE_ID}`;
+  return rows.length > 0 ? Number(rows[0].version) : 0;
+}
+
+async function writeStore(state: unknown): Promise<{ version: number; updatedAt: string }> {
+  const rows = await sql`
+    INSERT INTO medstudy_state (id, data, version, updated_at)
+    VALUES (${PROFILE_ID}, ${JSON.stringify(state)}::jsonb, 1, now())
+    ON CONFLICT (id) DO UPDATE
+      SET data = EXCLUDED.data,
+          version = medstudy_state.version + 1,
+          updated_at = now()
+    RETURNING version, updated_at
+  `;
+  return { version: Number(rows[0].version), updatedAt: new Date(rows[0].updated_at).toISOString() };
+}
+
+function sanitizeFileName(originalName: string) {
+  const ext = path.extname(originalName).toLowerCase();
+  const safeBase = path
+    .basename(originalName, ext)
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, 40);
+  return `${Date.now()}_${safeBase}${ext}`;
+}
+
+function blobPathFor(storedFileName: string) {
+  return `medstudy/uploads/${path.basename(storedFileName)}`;
+}
+
+async function readBlobBuffer(storedFileName: string): Promise<Buffer | null> {
+  const result = await get(blobPathFor(storedFileName), { access: 'public' });
+  if (!result || result.statusCode !== 200) return null;
+  return Buffer.from(await new Response(result.stream).arrayBuffer());
+}
 
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const allowed = [
@@ -155,6 +197,7 @@ RÈGLES IMPÉRATIVES :
 }
 
 async function startServer() {
+  await ensureSchema();
   const app = express();
   app.use(express.json({ limit: '25mb' }));
 
@@ -163,30 +206,47 @@ async function startServer() {
     res.json({ ok: true, service: 'MEDSTUDY' });
   });
 
-  // Load persistent state
-  app.get('/api/state', (_req: Request, res: Response) => {
-    const state = readStore();
-    res.json(state);
+  // Load persistent state (shared across all devices)
+  app.get('/api/state', async (_req: Request, res: Response) => {
+    try {
+      const { state, version } = await readStore();
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({ state, version });
+    } catch (error) {
+      console.error('Erreur lecture état:', error);
+      res.status(500).json({ error: 'Impossible de charger la progression.' });
+    }
+  });
+
+  // Lightweight version check used by devices to detect remote changes
+  app.get('/api/state/version', async (_req: Request, res: Response) => {
+    try {
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({ version: await readVersion() });
+    } catch (error) {
+      console.error('Erreur lecture version:', error);
+      res.status(500).json({ error: 'Impossible de vérifier la synchronisation.' });
+    }
   });
 
   // Save persistent state
-  app.put('/api/state', (req: Request, res: Response) => {
+  app.put('/api/state', async (req: Request, res: Response) => {
     try {
-      if (!req.body || typeof req.body !== 'object') {
+      if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
         res.status(400).json({ error: 'Données invalides.' });
         return;
       }
-      writeStore(req.body);
-      res.json({ ok: true, savedAt: new Date().toISOString() });
+      const { version, updatedAt } = await writeStore(req.body);
+      res.json({ ok: true, version, savedAt: updatedAt });
     } catch (error) {
       console.error('Erreur sauvegarde état:', error);
       res.status(500).json({ error: 'Impossible de sauvegarder la progression.' });
     }
   });
 
-  // Upload PDF or image file
+  // Upload PDF or image file to Vercel Blob (private)
   app.post('/api/upload', (req: Request, res: Response) => {
-    upload.single('file')(req, res, (err) => {
+    upload.single('file')(req, res, async (err) => {
       if (err) {
         res.status(400).json({ error: err.message || 'Erreur lors du téléversement.' });
         return;
@@ -195,45 +255,62 @@ async function startServer() {
         res.status(400).json({ error: 'Aucun fichier reçu.' });
         return;
       }
-      const storedFileName = req.file.filename;
-      res.json({
-        storedFileName,
-        originalName: req.file.originalname,
-        mimeType: req.file.mimetype,
-        size: req.file.size,
-        fileUrl: `/api/files/${encodeURIComponent(storedFileName)}`,
-      });
+      try {
+        const blob = await put(blobPathFor(sanitizeFileName(req.file.originalname)), req.file.buffer, {
+          access: 'public',
+          contentType: req.file.mimetype,
+          addRandomSuffix: true,
+        });
+        const storedFileName = path.basename(blob.pathname);
+        res.json({
+          storedFileName,
+          originalName: req.file.originalname,
+          mimeType: req.file.mimetype,
+          size: req.file.size,
+          fileUrl: `/api/files/${encodeURIComponent(storedFileName)}`,
+        });
+      } catch (uploadError) {
+        console.error('Erreur Blob upload:', uploadError);
+        res.status(500).json({ error: 'Erreur lors du téléversement du fichier.' });
+      }
     });
   });
 
-  // Serve uploaded files safely
-  app.get('/api/files/:filename', (req: Request, res: Response) => {
-    const safeName = path.basename(req.params.filename);
-    const fullPath = path.join(UPLOADS_DIR, safeName);
-    if (!fs.existsSync(fullPath)) {
-      res.status(404).json({ error: 'Fichier introuvable.' });
-      return;
+  // Serve uploaded files from private Blob storage
+  app.get('/api/files/:filename', async (req: Request, res: Response) => {
+    try {
+      const safeName = path.basename(req.params.filename);
+      const ifNoneMatch = req.headers['if-none-match'];
+      const result = await get(blobPathFor(safeName), {
+        access: 'public',
+        ifNoneMatch: typeof ifNoneMatch === 'string' ? ifNoneMatch : undefined,
+      });
+      if (!result) {
+        res.status(404).json({ error: 'Fichier introuvable.' });
+        return;
+      }
+      res.setHeader('ETag', result.blob.etag);
+      res.setHeader('Cache-Control', 'private, no-cache');
+      if (result.statusCode === 304) {
+        res.status(304).end();
+        return;
+      }
+      res.setHeader('Content-Type', result.blob.contentType || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `inline; filename="${safeName}"`);
+      const buffer = Buffer.from(await new Response(result.stream).arrayBuffer());
+      res.end(buffer);
+    } catch (error) {
+      console.error('Erreur lecture fichier:', error);
+      res.status(500).json({ error: 'Impossible de lire le fichier.' });
     }
-    const ext = path.extname(safeName).toLowerCase();
-    const mimeMap: Record<string, string> = {
-      '.pdf': 'application/pdf',
-      '.png': 'image/png',
-      '.jpg': 'image/jpeg',
-      '.jpeg': 'image/jpeg',
-      '.webp': 'image/webp',
-      '.txt': 'text/plain; charset=utf-8',
-    };
-    res.setHeader('Content-Type', mimeMap[ext] || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `inline; filename="${safeName}"`);
-    fs.createReadStream(fullPath).pipe(res);
   });
 
   // Delete uploaded file
-  app.delete('/api/files/:filename', (req: Request, res: Response) => {
-    const safeName = path.basename(req.params.filename);
-    const fullPath = path.join(UPLOADS_DIR, safeName);
-    if (fs.existsSync(fullPath)) {
-      fs.unlinkSync(fullPath);
+  app.delete('/api/files/:filename', async (req: Request, res: Response) => {
+    try {
+      await del(blobPathFor(path.basename(req.params.filename)));
+    } catch (error) {
+      console.error('Erreur suppression fichier:', error);
     }
     res.json({ ok: true });
   });
@@ -273,9 +350,8 @@ async function startServer() {
 
       if (storedFileName) {
         const safeName = path.basename(storedFileName);
-        const fullPath = path.join(UPLOADS_DIR, safeName);
-        if (fs.existsSync(fullPath)) {
-          const fileBuffer = fs.readFileSync(fullPath);
+        const fileBuffer = await readBlobBuffer(safeName);
+        if (fileBuffer) {
           const detectedMime =
             mimeType ||
             (safeName.endsWith('.pdf')
